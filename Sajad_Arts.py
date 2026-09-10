@@ -16,22 +16,195 @@ from urllib.parse import quote
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from io import BytesIO
-
+import re
 from datetime import datetime
-
+import uuid
+import hashlib
 
 # ============================================================
 # PAGE CONFIGURATION
 # ============================================================
 
-st.set_page_config(page_title="Shawl Billing App", page_icon="🧣", layout="wide")
-
-
+st.set_page_config(page_title="MAPOS Billing App", page_icon="🧣", layout="wide")
 # ========================================================
 # GOOGLE SHEETS CONNECTION
 # ========================================================
 
 conn = st.connection("gsheets", type=GSheetsConnection)
+
+
+@st.cache_data(ttl=30)
+def get_bills():
+
+    try:
+        bills_df = conn.read(worksheet="Bills", ttl=30)
+
+        if bills_df.empty:
+            return pd.DataFrame()
+
+        # ====================================================
+        # CLEAN TEXT COLUMNS
+        # ====================================================
+
+        text_columns = [
+            "Transaction ID",
+            "Date",
+            "Customer Name",
+            "Customer Number",
+            "Item",
+            "Payment Mode",
+            "Inventory Updated",
+        ]
+
+        for column in text_columns:
+            if column in bills_df.columns:
+                bills_df[column] = bills_df[column].fillna("").astype(str).str.strip()
+
+        # ====================================================
+        # CLEAN INTEGER COLUMNS
+        # ====================================================
+
+        integer_columns = [
+            "Bill No",
+            "Quantity",
+        ]
+
+        for column in integer_columns:
+            if column in bills_df.columns:
+                bills_df[column] = (
+                    pd
+                    .to_numeric(bills_df[column], errors="coerce")
+                    .fillna(0)
+                    .astype(int)
+                )
+
+        # ====================================================
+        # CLEAN NUMERIC COLUMNS
+        # ====================================================
+
+        numeric_columns = [
+            "Rate",
+            "Amount",
+            "Sub Total",
+            "GST %",
+            "GST Amount",
+            "Grand Total",
+        ]
+
+        for column in numeric_columns:
+            if column in bills_df.columns:
+                bills_df[column] = pd.to_numeric(
+                    bills_df[column], errors="coerce"
+                ).fillna(0.0)
+
+        return bills_df
+
+    except Exception:
+        return pd.DataFrame()
+
+
+# ========================================================
+# GET NEXT BILL NUMBER FROM GOOGLE SHEETS
+# ========================================================
+
+
+def get_next_bill_number():
+    """
+    Gets the highest Bill No from Google Sheets
+    and returns the next bill number.
+    """
+
+    try:
+        bills_df = get_bills()
+
+        # No bills yet
+        if bills_df.empty:
+            return 1
+
+        # Bill No column does not exist
+        if "Bill No" not in bills_df.columns:
+            return 1
+
+        # Convert Bill No values to numbers
+        bill_numbers = pd.to_numeric(bills_df["Bill No"], errors="coerce").dropna()
+
+        # No valid bill numbers
+        if bill_numbers.empty:
+            return 1
+
+        # Highest bill number + 1
+        return int(bill_numbers.max()) + 1
+
+    except Exception as e:
+        st.error(f"Could not get next Bill Number from Google Sheets: {e}")
+
+        return 1
+
+
+# ============================================================
+# INPUT VALIDATION
+# ============================================================
+
+
+def validate_name(name):
+    """
+    Allows letters and spaces only.
+    Examples:
+    Mohammad Amaan -> Valid
+    Amaan -> Valid
+    Amaan123 -> Invalid
+    Amaan@ -> Invalid
+    """
+    name = name.strip()
+
+    if not name:
+        return False, "Name cannot be empty."
+
+    if not re.fullmatch(r"[A-Za-z ]+", name):
+        return False, "Name can contain letters and spaces only."
+
+    return True, ""
+
+
+def validate_phone(phone):
+    """
+    Allows numbers only and requires exactly 10 digits.
+    """
+    phone = phone.strip()
+
+    if not phone:
+        return False, "Phone number cannot be empty."
+
+    if not phone.isdigit():
+        return False, "Phone number can contain numbers only."
+
+    if len(phone) != 10:
+        return False, "Phone number must contain exactly 10 digits."
+
+    return True, ""
+
+
+def validate_shop_phone(phone):
+    """
+    Allows numbers only and requires exactly 10 digits.
+    """
+    phone = phone.strip()
+
+    if not phone:
+        return False, "Shop phone number cannot be empty."
+
+    if not phone.isdigit():
+        return False, "Shop phone number can contain numbers only."
+
+    if len(phone) != 10:
+        return False, "Shop phone number must contain exactly 10 digits."
+
+    return True, ""
+
+
+# ============================================================
+# NUMBER TO WORDS
+# ============================================================
 
 
 def number_to_words(number):
@@ -134,6 +307,7 @@ def number_to_words(number):
 
     return f"{rupees_words} Rupees Only"
 
+
 # ============================================================
 # SESSION STATE
 # ============================================================
@@ -141,11 +315,25 @@ def number_to_words(number):
 if "products" not in st.session_state:
     st.session_state.products = []
 
-if "bill_no" not in st.session_state:
-    st.session_state.bill_no = 1
+if "current_bill_no" not in st.session_state:
+    st.session_state.current_bill_no = get_next_bill_number()
+
+if "transaction_id" not in st.session_state:
+    st.session_state.transaction_id = str(uuid.uuid4())
+
+if "bill_saved" not in st.session_state:
+    st.session_state.bill_saved = False
+
+if "inventory_updated" not in st.session_state:
+    st.session_state.inventory_updated = False
 
 if "product_form_reset" not in st.session_state:
     st.session_state.product_form_reset = 0
+
+if "processed_inventory_file" not in st.session_state:
+    st.session_state.processed_inventory_file = None
+
+
 # ============================================================
 # PDF GENERATOR
 # ============================================================
@@ -561,6 +749,7 @@ def generate_pdf(
 
 def save_bill_to_google_sheet(
     bill_no,
+    transaction_id,
     customer_name,
     customer_phone,
     products,
@@ -569,9 +758,46 @@ def save_bill_to_google_sheet(
     gst_amount,
     grand_total,
     payment_method,
+    inventory_updated="Pending",
 ):
 
     bill_date = datetime.now().strftime("%d/%m/%y")
+
+    # ----------------------------------------------------
+    # READ EXISTING BILLS
+    # ----------------------------------------------------
+
+    existing_data = conn.read(worksheet="Bills", ttl=0)
+
+    # ----------------------------------------------------
+    # DUPLICATE PROTECTION
+    # ----------------------------------------------------
+
+    if not existing_data.empty:
+        # Check Transaction ID
+        if "Transaction ID" in existing_data.columns:
+            transaction_exists = (
+                existing_data["Transaction ID"]
+                .astype(str)
+                .eq(str(transaction_id))
+                .any()
+            )
+
+            if transaction_exists:
+                return False, "This bill has already been saved."
+
+        # Also check Bill Number
+        if "Bill No" in existing_data.columns:
+            bill_numbers = pd.to_numeric(existing_data["Bill No"], errors="coerce")
+
+            bill_exists = (bill_numbers == int(bill_no)).any()
+
+            if bill_exists:
+                return False, (f"Bill No {bill_no} already exists in Google Sheets.")
+
+    # ----------------------------------------------------
+    # CREATE BILL ROWS
+    # ----------------------------------------------------
 
     new_rows = []
 
@@ -580,6 +806,7 @@ def save_bill_to_google_sheet(
 
         new_rows.append({
             "Bill No": bill_no,
+            "Transaction ID": transaction_id,
             "Date": bill_date,
             "Customer Name": customer_name,
             "Customer Number": customer_phone,
@@ -592,33 +819,261 @@ def save_bill_to_google_sheet(
             "GST Amount": gst_amount,
             "Grand Total": grand_total,
             "Payment Mode": payment_method,
+            "Inventory Updated": inventory_updated,
         })
 
     new_data = pd.DataFrame(new_rows)
 
-    # Read existing bills
-    existing_data = conn.read(worksheet="Bills", ttl=0)
+    # ----------------------------------------------------
+    # APPEND BILL
+    # ----------------------------------------------------
 
-    # Append new bill
     if existing_data.empty:
         final_data = new_data
+
     else:
         final_data = pd.concat([existing_data, new_data], ignore_index=True)
 
-    # Update Google Sheet
-    conn.update(worksheet="Bills", data=final_data)
+    # ----------------------------------------------------
+    # SAVE
+    # ----------------------------------------------------
 
-    # Clear cached data
-    st.cache_data.clear()
+    conn.update(worksheet="Bills", data=final_data)
+    get_bills.clear()
+
+    return True, "Bill saved successfully.", final_data
+
+
+# ========================================================
+# MARK INVENTORY AS UPDATED
+# ========================================================
+def mark_inventory_updated(transaction_id, bills_df):
+
+    try:
+        if bills_df is None or bills_df.empty:
+            return False
+
+        # Make sure column exists
+        if "Inventory Updated" not in bills_df.columns:
+            bills_df["Inventory Updated"] = "Pending"
+
+        # Find rows belonging to this transaction
+        matching_rows = (
+            bills_df["Transaction ID"].astype(str).str.strip()
+            == str(transaction_id).strip()
+        )
+
+        if not matching_rows.any():
+            return False
+
+        # -----------------------------------------------
+        # INVENTORY WAS SUCCESSFULLY UPDATED
+        # -----------------------------------------------
+
+        bills_df.loc[matching_rows, "Inventory Updated"] = "Updated"
+
+        # Update Google Sheet
+        conn.update(worksheet="Bills", data=bills_df)
+
+        # Clear cached bills
+        get_bills.clear()
+
+        return True
+
+    except Exception as e:
+        raise RuntimeError(f"Could not mark inventory as updated: {e}")
+
+
+# ========================================================
+# INVENTORY / PRODUCT LIST
+# ========================================================
+
+DEFAULT_PRODUCTS = [
+    {"Item": "Hashidar", "Stock": 0},
+    {"Item": "Koundar", "Stock": 0},
+    {"Item": "Pointdar", "Stock": 0},
+    {"Item": "Paldar", "Stock": 0},
+    {"Item": "Jaildar", "Stock": 0},
+    {"Item": "Plain Colour", "Stock": 0},
+    {"Item": "Zaati", "Stock": 0},
+    {"Item": "Ari", "Stock": 0},
+]
+
+
+@st.cache_data(ttl=30)
+def get_inventory():
+
+    try:
+        inventory_df = conn.read(worksheet="Inventory", ttl=30)
+
+        if inventory_df.empty:
+            return pd.DataFrame(DEFAULT_PRODUCTS)
+
+        # Make sure Item column exists
+        if "Item" not in inventory_df.columns:
+            return pd.DataFrame(DEFAULT_PRODUCTS)
+
+        # Make sure Stock column exists
+        if "Stock" not in inventory_df.columns:
+            inventory_df["Stock"] = 0
+
+        # Only use Item and Stock
+        inventory_df = inventory_df[["Item", "Stock"]].copy()
+
+        # Clean Item
+        inventory_df["Item"] = inventory_df["Item"].fillna("").astype(str).str.strip()
+
+        # Clean Stock
+        inventory_df["Stock"] = (
+            pd.to_numeric(inventory_df["Stock"], errors="coerce").fillna(0).astype(int)
+        )
+
+        # Remove blank products
+        inventory_df = inventory_df[inventory_df["Item"] != ""]
+
+        # Remove duplicate products
+        inventory_df = inventory_df.drop_duplicates(
+            subset=["Item"], keep="last"
+        ).reset_index(drop=True)
+
+        return inventory_df
+
+    except Exception:
+        return pd.DataFrame(DEFAULT_PRODUCTS)
+
+
+def update_inventory(inventory_df):
+
+    inventory_df = inventory_df[["Item", "Stock"]].copy()
+
+    inventory_df["Item"] = inventory_df["Item"].fillna("").astype(str).str.strip()
+
+    inventory_df["Stock"] = pd.to_numeric(
+        inventory_df["Stock"], errors="coerce"
+    ).fillna(0)
+
+    inventory_df["Stock"] = inventory_df["Stock"].astype(int)
+
+    inventory_df = inventory_df[inventory_df["Item"] != ""]
+
+    inventory_df = inventory_df.drop_duplicates(
+        subset=["Item"], keep="last"
+    ).reset_index(drop=True)
+
+    conn.update(worksheet="Inventory", data=inventory_df)
+
+    # Clear ONLY the inventory cache
+    get_inventory.clear()
+
+
+# ========================================================
+# CHECK INVENTORY BEFORE BILL
+# ========================================================
+
+
+def check_inventory(products, inventory_df):
+
+    for product in products:
+        product_name = product["name"]
+        requested_quantity = int(product["quantity"])
+
+        matching_rows = inventory_df[
+            inventory_df["Item"].str.lower() == product_name.lower()
+        ]
+
+        # Product doesn't exist
+        if matching_rows.empty:
+            return (False, f"Product '{product_name}' is not available in inventory.")
+
+        current_stock = int(matching_rows.iloc[0]["Stock"])
+
+        # Not enough stock
+        if requested_quantity > current_stock:
+            return (
+                False,
+                f"Not enough stock for '{product_name}'. "
+                f"Available: {current_stock}, "
+                f"Requested: {requested_quantity}.",
+            )
+
+    return True, ""
+
+
+# ========================================================
+# REDUCE INVENTORY SAFELY
+# ========================================================
+
+
+def reduce_inventory_once(products, transaction_id, inventory_df):
+
+    # ----------------------------------------------------
+    # CHECK SESSION STATE
+    # ----------------------------------------------------
+
+    if st.session_state.get("inventory_updated", False):
+        return False, "Inventory has already been updated for this bill."
+
+    # ----------------------------------------------------
+    # CHECK ALL PRODUCTS FIRST
+    # ----------------------------------------------------
+
+    for product in products:
+        product_name = product["name"]
+        sold_quantity = int(product["quantity"])
+
+        matching_rows = inventory_df[
+            inventory_df["Item"].str.lower() == product_name.lower()
+        ]
+
+        if matching_rows.empty:
+            raise ValueError(f"Product '{product_name}' was not found in inventory.")
+
+        index = matching_rows.index[0]
+
+        current_stock = int(inventory_df.loc[index, "Stock"])
+
+        if sold_quantity > current_stock:
+            raise ValueError(
+                f"Not enough stock for '{product_name}'. "
+                f"Available: {current_stock}, "
+                f"Requested: {sold_quantity}."
+            )
+
+    # ----------------------------------------------------
+    # ALL STOCK CHECKS PASSED
+    # ----------------------------------------------------
+
+    for product in products:
+        product_name = product["name"]
+        sold_quantity = int(product["quantity"])
+
+        matching_rows = inventory_df[
+            inventory_df["Item"].str.lower() == product_name.lower()
+        ]
+
+        index = matching_rows.index[0]
+
+        current_stock = int(inventory_df.loc[index, "Stock"])
+
+        inventory_df.loc[index, "Stock"] = current_stock - sold_quantity
+
+    # ----------------------------------------------------
+    # SAVE UPDATED INVENTORY
+    # ----------------------------------------------------
+    update_inventory(inventory_df)
+
+    # Mark inventory as updated for this transaction
+    st.session_state.inventory_updated = True
+
+    return True, "Inventory updated successfully."
 
 
 # ============================================================
 # APP HEADER
 # ============================================================
 
-st.title("🧣 Shawl Billing App")
-st.caption("Simple billing system for your shawl/stole business")
-
+st.title("🧾 MAPOS Billing")
+st.caption("Simple billing and inventory management system")
 
 # ============================================================
 # SIDEBAR - SHOP DETAILS
@@ -631,8 +1086,16 @@ shop_name = st.sidebar.text_input("Shop Name", value="Sajad Arts")
 shop_location = st.sidebar.text_input(
     "Shop Location", value="Srinagar, Jammu & Kashmir"
 )
+shop_phone = st.sidebar.text_input(
+    "Shop Phone Number", value="8494001112", max_chars=10, key="shop_phone"
+)
 
-shop_phone = st.sidebar.text_input("Shop Phone Number", value="8494001112")
+# Validate shop phone
+if shop_phone:
+    shop_phone_valid, shop_phone_error = validate_shop_phone(shop_phone)
+
+    if not shop_phone_valid:
+        st.sidebar.error(f"⚠️ {shop_phone_error}")
 
 instagram = st.sidebar.text_input("Instagram Username", value="@mohammadamaan32")
 
@@ -645,9 +1108,23 @@ st.sidebar.divider()
 
 st.sidebar.title("👤 Customer Details")
 
-customer_name = st.sidebar.text_input("Customer Name")
+customer_name = st.sidebar.text_input("Customer Name", key="customer_name")
 
-customer_phone = st.sidebar.text_input("Customer Phone Number")
+if customer_name:
+    customer_name_valid, customer_name_error = validate_name(customer_name)
+
+    if not customer_name_valid:
+        st.sidebar.error(f"⚠️ {customer_name_error}")
+
+customer_phone = st.sidebar.text_input(
+    "Customer Phone Number", max_chars=10, key="customer_phone"
+)
+
+if customer_phone:
+    customer_phone_valid, customer_phone_error = validate_phone(customer_phone)
+
+    if not customer_phone_valid:
+        st.sidebar.error(f"⚠️ {customer_phone_error}")
 
 payment_method = st.sidebar.selectbox(
     "Payment Method", ["Cash", "UPI", "Card", "Bank Transfer", "Other"]
@@ -655,6 +1132,281 @@ payment_method = st.sidebar.selectbox(
 
 st.sidebar.divider()
 
+# ========================================================
+# PRODUCT LIST / INVENTORY
+# ========================================================
+
+st.sidebar.header("📦 Product List")
+
+st.sidebar.caption(
+    "Export your product list, edit it in Excel, "
+    "and upload it back to update the dropdown."
+)
+
+# Load inventory
+inventory_df = get_inventory()
+
+# --------------------------------------------------------
+# EXPORT INVENTORY
+# --------------------------------------------------------
+
+excel_buffer = BytesIO()
+
+with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+    # Write inventory data
+    inventory_df.to_excel(writer, index=False, sheet_name="Inventory")
+
+    # Get worksheet
+    worksheet = writer.sheets["Inventory"]
+
+    # ====================================================
+    # HEADER STYLE
+    # ====================================================
+
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    # Grey header background
+    header_fill = PatternFill(fill_type="solid", fgColor="D9D9D9")
+
+    # Bold header font
+    header_font = Font(bold=True)
+
+    # Center alignment
+    header_alignment = Alignment(horizontal="center", vertical="center")
+
+    # Thin border
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+
+    # Apply style to header row
+    for cell in worksheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_alignment
+        cell.border = thin_border
+
+    # ====================================================
+    # STYLE DATA CELLS
+    # ====================================================
+
+    for row in worksheet.iter_rows(
+        min_row=2, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column
+    ):
+        for cell in row:
+            cell.border = thin_border
+
+            cell.alignment = Alignment(vertical="center")
+
+    # ====================================================
+    # COLUMN WIDTHS
+    # ====================================================
+
+    worksheet.column_dimensions["A"].width = 25
+    worksheet.column_dimensions["B"].width = 15
+
+    # ====================================================
+    # ROW HEIGHT
+    # ====================================================
+
+    worksheet.row_dimensions[1].height = 25
+
+    # ====================================================
+    # FREEZE HEADER
+    # ====================================================
+
+    worksheet.freeze_panes = "A2"
+
+excel_buffer.seek(0)
+
+st.sidebar.download_button(
+    label="📥 Export Items Excel",
+    data=excel_buffer,
+    file_name="Sajad_Arts_Inventory.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True,
+)
+
+# --------------------------------------------------------
+# UPLOAD INVENTORY
+# --------------------------------------------------------
+
+st.sidebar.write("")
+
+st.sidebar.subheader("📤 Upload Updated Items Excel")
+
+uploaded_inventory = st.sidebar.file_uploader(
+    "Upload", type=["xlsx"], key="inventory_upload"
+)
+
+
+# ========================================================
+# PROCESS UPLOADED INVENTORY
+# ========================================================
+
+if uploaded_inventory is not None:
+    try:
+        # ====================================================
+        # CREATE UNIQUE HASH FOR UPLOADED FILE
+        # ====================================================
+
+        uploaded_inventory.seek(0)
+
+        file_bytes = uploaded_inventory.getvalue()
+
+        file_hash = hashlib.md5(file_bytes).hexdigest()
+
+        # ====================================================
+        # ONLY PROCESS FILE IF IT HAS NOT BEEN PROCESSED
+        # ====================================================
+
+        if st.session_state.get("processed_inventory_file") != file_hash:
+            # ====================================================
+            # READ EXCEL FILE
+            # ====================================================
+
+            excel_file = pd.ExcelFile(BytesIO(file_bytes), engine="openpyxl")
+
+            sheet_names = excel_file.sheet_names
+
+            if not sheet_names:
+                raise ValueError("The Excel file contains no worksheets.")
+
+            # ====================================================
+            # FIND INVENTORY SHEET
+            # ====================================================
+
+            inventory_sheet = next(
+                (
+                    sheet
+                    for sheet in sheet_names
+                    if str(sheet).strip().lower() == "inventory"
+                ),
+                sheet_names[0],
+            )
+
+            # ====================================================
+            # READ SELECTED SHEET
+            # ====================================================
+
+            uploaded_df = pd.read_excel(
+                excel_file, sheet_name=inventory_sheet, engine="openpyxl"
+            )
+
+            # ====================================================
+            # CLEAN COLUMN NAMES
+            # ====================================================
+
+            uploaded_df.columns = [
+                str(column).strip() for column in uploaded_df.columns
+            ]
+
+            column_lookup = {
+                str(column).strip().lower(): column for column in uploaded_df.columns
+            }
+
+            # ====================================================
+            # CHECK ITEM COLUMN
+            # ====================================================
+
+            if "item" not in column_lookup:
+                raise ValueError(
+                    "Could not find an 'Item' column. "
+                    f"Found columns: {list(uploaded_df.columns)}"
+                )
+
+            item_column = column_lookup["item"]
+
+            uploaded_df = uploaded_df.rename(columns={item_column: "Item"})
+
+            # ====================================================
+            # STOCK COLUMN
+            # ====================================================
+
+            if "stock" in column_lookup:
+                stock_column = column_lookup["stock"]
+
+                uploaded_df = uploaded_df.rename(columns={stock_column: "Stock"})
+
+            else:
+                uploaded_df["Stock"] = 0
+
+            # ====================================================
+            # KEEP ONLY REQUIRED COLUMNS
+            # ====================================================
+
+            uploaded_df = uploaded_df[["Item", "Stock"]].copy()
+
+            # ====================================================
+            # CLEAN ITEM
+            # ====================================================
+
+            uploaded_df["Item"] = uploaded_df["Item"].fillna("").astype(str).str.strip()
+
+            # ====================================================
+            # CLEAN STOCK
+            # ====================================================
+
+            uploaded_df["Stock"] = (
+                pd
+                .to_numeric(uploaded_df["Stock"], errors="coerce")
+                .fillna(0)
+                .astype(int)
+            )
+
+            # ====================================================
+            # REMOVE BLANK PRODUCTS
+            # ====================================================
+
+            uploaded_df = uploaded_df[uploaded_df["Item"] != ""]
+
+            # ====================================================
+            # REMOVE DUPLICATE PRODUCTS
+            # ====================================================
+
+            uploaded_df = uploaded_df.drop_duplicates(
+                subset=["Item"], keep="last"
+            ).reset_index(drop=True)
+
+            # ====================================================
+            # CHECK EMPTY FILE
+            # ====================================================
+
+            if uploaded_df.empty:
+                raise ValueError("No products were found in the Excel file.")
+
+            # ====================================================
+            # UPDATE GOOGLE SHEETS
+            # ====================================================
+
+            update_inventory(uploaded_df)
+
+            # ====================================================
+            # MARK THIS FILE AS PROCESSED
+            # ====================================================
+
+            st.session_state.processed_inventory_file = file_hash
+
+            st.sidebar.success(f"✅ {len(uploaded_df)} products updated successfully!")
+
+            # ====================================================
+            # RERUN ONCE
+            # ====================================================
+
+            st.rerun()
+
+        else:
+            # ====================================================
+            # FILE WAS ALREADY PROCESSED
+            # ====================================================
+
+            st.sidebar.success("✅ Inventory is already updated from this file.")
+
+    except Exception as e:
+        st.sidebar.error(f"Could not read Excel file: {type(e).__name__}: {e}")
 
 # ============================================================
 # BILL NUMBER
@@ -662,13 +1414,45 @@ st.sidebar.divider()
 
 st.sidebar.title("🧾 Bill Information")
 
-bill_no = st.sidebar.number_input(
-    "Bill Number",
-    min_value=1,
-    value=st.session_state.bill_no,
-    step=1,
-    key="bill_number",
-)
+bill_no = st.session_state.current_bill_no
+
+st.sidebar.info(f"🧾 Current Bill Number: **{bill_no}**")
+
+# ============================================================
+# GET REMAINING STOCK FOR CURRENT BILL
+# ============================================================
+
+
+def get_remaining_stock(product_name, inventory_df):
+    """
+    Returns stock remaining after quantities already added
+    to the current bill.
+
+    Google Sheets inventory is NOT changed here.
+    """
+
+    # Get actual inventory stock
+    matching_product = inventory_df[
+        inventory_df["Item"].str.lower().str.strip() == product_name.lower().strip()
+    ]
+
+    if matching_product.empty:
+        return 0
+
+    available_stock = int(matching_product.iloc[0]["Stock"])
+
+    # Calculate quantity already added to current bill
+    already_added = sum(
+        int(product["quantity"])
+        for product in st.session_state.products
+        if product["name"].strip().lower() == product_name.strip().lower()
+    )
+
+    # Remaining stock
+    remaining_stock = available_stock - already_added
+
+    return remaining_stock
+
 
 # ============================================================
 # PRODUCT ENTRY / EDIT PRODUCT
@@ -687,28 +1471,20 @@ if st.session_state.editing_product is not None:
 
     st.info(f"✏️ Editing Product: {edit_product['name']}")
 
-    # --------------------------------------------------------
-    # PRODUCT OPTIONS
-    # --------------------------------------------------------
+    # ========================================================
+    # PRODUCT OPTIONS FROM INVENTORY
+    # ========================================================
 
-    product_options = [
-        "Hashidar",
-        "Koundar",
-        "Pointdar",
-        "Paldar",
-        "Jaildar",
-        "Plain Colour",
-        "Zaati",
-        "Ari",
-        "➕ Add New Product...",
-    ]
+    product_options = inventory_df["Item"].dropna().astype(str).str.strip().tolist()
 
-    # If the existing product is not in the standard list,
-    # add it temporarily so it can still be selected.
     current_product = edit_product["name"]
 
     if current_product not in product_options:
-        product_options.insert(0, current_product)
+        st.error(
+            f"❌ '{current_product}' is no longer available in Inventory. "
+            "Please cancel this edit and select a product from Inventory."
+        )
+        st.stop()
 
     # --------------------------------------------------------
     # INPUT FIELDS
@@ -728,16 +1504,7 @@ if st.session_state.editing_product is not None:
             key="edit_product_select",
         )
 
-        # If user chooses Add New Product
-        if selected_edit_product == "➕ Add New Product...":
-            product_name = st.text_input(
-                "Enter New Product Name",
-                placeholder="Type new product name",
-                key="edit_new_product_name",
-            )
-
-        else:
-            product_name = selected_edit_product
+        product_name = selected_edit_product
 
     # --------------------------------------------------------
     # QUANTITY
@@ -816,34 +1583,55 @@ if st.session_state.editing_product is not None:
         st.rerun()
 
 else:
+    # ========================================================
+    # COLUMNS
+    # ========================================================
+
     col1, col2, col3, col4 = st.columns([3, 2, 2.5, 1])
 
+    # ========================================================
+    # PRODUCT NAME
+    # ========================================================
+
     with col1:
-        product_options = [
-            "Hashidar",
-            "Koundar",
-            "Pointdar",
-            "Paldar",
-            "Jaildar",
-            "Plain Colour",
-            "Zaati",
-            "Ari",
-            "➕ Add New Product...",
-        ]
+        product_options = inventory_df["Item"].dropna().astype(str).str.strip().tolist()
+
+        if not product_options:
+            st.warning(
+                "⚠️ No products found in Inventory. "
+                "Please upload your Inventory Excel file first."
+            )
+            st.stop()
 
         selected_product = st.selectbox(
-            "Product Name", product_options, key="selected_product"
+            "Product Name",
+            product_options,
+            key="selected_product",
         )
+        # ----------------------------------------------------
+        # ADD NEW PRODUCT
+        # ----------------------------------------------------
 
-        if selected_product == "➕ Add New Product...":
-            product_name = st.text_input(
-                "Enter New Product Name",
-                placeholder="Type new product name",
-                key="new_product_name",
-            )
+        product_name = selected_product
 
+        # Get remaining stock for the current bill
+        remaining_stock = get_remaining_stock(selected_product, inventory_df)
+
+        # Keep this variable for validation
+        available_stock = remaining_stock
+
+        # ----------------------------------------------------
+        # AVAILABLE STOCK
+        # ----------------------------------------------------
+
+        if remaining_stock >= 0:
+            st.caption(f"📦 Remaining Stock: {remaining_stock}")
         else:
-            product_name = selected_product
+            st.caption(f"⚠️ Remaining Stock: {remaining_stock} (Not enough stock)")
+
+    # ========================================================
+    # QUANTITY
+    # ========================================================
 
     with col2:
         quantity = st.number_input(
@@ -852,8 +1640,12 @@ else:
             value=0,
             step=1,
             format="%d",
-            key=f"new_quantity_{st.session_state.product_form_reset}",
+            key=(f"new_quantity_{st.session_state.product_form_reset}"),
         )
+
+    # ========================================================
+    # RATE
+    # ========================================================
 
     with col3:
         rate = st.number_input(
@@ -861,38 +1653,97 @@ else:
             min_value=0.0,
             value=0.0,
             step=50.0,
-            key=f"new_rate_{st.session_state.product_form_reset}",
+            key=(f"new_rate_{st.session_state.product_form_reset}"),
         )
+
+    # ========================================================
+    # STOCK AFTER SALE
+    # ========================================================
+
+    if selected_product != "➕ Add New Product..." and quantity > 0:
+        stock_after_this_addition = remaining_stock - quantity
+
+        if stock_after_this_addition >= 0:
+            st.caption(f"📉 Stock After This Addition: {stock_after_this_addition}")
+
+        else:
+            st.caption(
+                f"⚠️ Stock After This Addition: "
+                f"{stock_after_this_addition} "
+                "(Not enough stock)"
+            )
+
+    # ========================================================
+    # ADD BUTTON
+    # ========================================================
 
     with col4:
         st.write("")
         st.write("")
 
-        add_product = st.button("➕ Add", width="stretch")
+        add_product = st.button(
+            "➕ Add",
+            width="stretch",
+            key="add_product_button",
+        )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ADD PRODUCT
-    # --------------------------------------------------------
+    # ========================================================
 
     if add_product:
+        # ----------------------------------------------------
+        # PRODUCT NAME VALIDATION
+        # ----------------------------------------------------
+
         if product_name.strip() == "":
             st.error("Please enter the product name.")
+
+        # ----------------------------------------------------
+        # QUANTITY VALIDATION
+        # ----------------------------------------------------
 
         elif quantity <= 0:
             st.error("Please enter a quantity greater than 0.")
 
+        # ----------------------------------------------------
+        # RATE VALIDATION
+        # ----------------------------------------------------
+
         elif rate <= 0:
             st.error("Please enter a valid rate.")
 
+        # ----------------------------------------------------
+        # STOCK VALIDATION
+        # ----------------------------------------------------
+
+        elif quantity > available_stock:
+            st.error(
+                f"❌ Not enough stock for "
+                f"{product_name}. "
+                f"Available stock: {available_stock}"
+            )
+
+        # ----------------------------------------------------
+        # ADD PRODUCT SUCCESSFULLY
+        # ----------------------------------------------------
+
         else:
-            product = {"name": product_name, "quantity": quantity, "rate": rate}
+            product = {
+                "name": product_name.strip(),
+                "quantity": quantity,
+                "rate": rate,
+            }
 
             st.session_state.products.append(product)
 
-            # Create fresh Quantity and Rate widgets
+            # ------------------------------------------------
+            # RESET QUANTITY AND RATE
+            # ------------------------------------------------
+
             st.session_state.product_form_reset += 1
 
-            st.success(f"{product_name} added successfully!")
+            st.success(f"✅ {product_name} added successfully!")
 
             st.rerun()
 
@@ -1035,63 +1886,139 @@ generate_bill = st.button("🧾 Generate Bill", type="primary", width="stretch")
 
 
 if generate_bill:
-    # Validate customer
-    if customer_name.strip() == "":
-        st.error("Please enter the customer name.")
+    # ========================================================
+    # BASIC VALIDATION
+    # ========================================================
 
-    elif customer_phone.strip() == "":
-        st.error("Please enter the customer phone number.")
+    customer_name_valid, customer_name_error = validate_name(customer_name)
+
+    customer_phone_valid, customer_phone_error = validate_phone(customer_phone)
+
+    shop_phone_valid, shop_phone_error = validate_shop_phone(shop_phone)
+
+    if not customer_name_valid:
+        st.error(f"❌ Customer Name: {customer_name_error}")
+
+    elif not customer_phone_valid:
+        st.error(f"❌ Customer Phone: {customer_phone_error}")
+
+    elif not shop_phone_valid:
+        st.error(f"❌ Shop Phone: {shop_phone_error}")
 
     elif len(st.session_state.products) == 0:
-        st.error("Please add at least one product.")
+        st.error("❌ Please add at least one product.")
+
+    elif st.session_state.bill_saved:
+        st.warning(f"⚠️ Bill No {bill_no} has already been generated.")
 
     else:
-        pdf_bytes = generate_pdf(
-            shop_name=shop_name,
-            shop_location=shop_location,
-            shop_phone=shop_phone,
-            bill_no=bill_no,
-            customer_name=customer_name,
-            customer_phone=customer_phone,
-            payment_method=payment_method,
-            products=st.session_state.products,
-            subtotal=subtotal,
-            gst_rate=gst_rate,
-            gst_amount=gst_amount,
-            grand_total=grand_total,
-            total_items=total_items,
-            instagram=instagram,
+        # ====================================================
+        # CHECK INVENTORY FIRST
+        # ====================================================
+
+        stock_available, stock_error = check_inventory(
+            st.session_state.products, inventory_df
         )
 
-        # Store PDF in session
-        st.session_state.pdf_bytes = pdf_bytes
-        st.session_state.generated_bill_no = bill_no
+        if not stock_available:
+            st.error(f"❌ {stock_error}")
 
-        st.success("✅ Bill generated successfully!")
+        else:
+            # =================================================
+            # GENERATE PDF
+            # =================================================
 
-        # ====================================================
-        # SAVE BILL TO GOOGLE SHEETS
-        # ====================================================
-
-        try:
-            save_bill_to_google_sheet(
+            pdf_bytes = generate_pdf(
+                shop_name=shop_name,
+                shop_location=shop_location,
+                shop_phone=shop_phone,
                 bill_no=bill_no,
                 customer_name=customer_name,
                 customer_phone=customer_phone,
+                payment_method=payment_method,
                 products=st.session_state.products,
                 subtotal=subtotal,
                 gst_rate=gst_rate,
                 gst_amount=gst_amount,
                 grand_total=grand_total,
-                payment_method=payment_method,
+                total_items=total_items,
+                instagram=instagram,
             )
 
-            st.success("✅ Bill generated and saved successfully!")
+            # =================================================
+            # STORE PDF
+            # =================================================
 
-        except Exception as e:
-            st.error(
-                f"Bill PDF was generated, but Google Sheets could not be updated: {e}"
-            )
+            st.session_state.pdf_bytes = pdf_bytes
+
+            st.session_state.generated_bill_no = bill_no
+
+            # =================================================
+            # SAVE BILL
+            # =================================================
+
+            try:
+                bill_saved, bill_message, saved_bills_df = save_bill_to_google_sheet(
+                    bill_no=bill_no,
+                    transaction_id=(st.session_state.transaction_id),
+                    customer_name=customer_name,
+                    customer_phone=customer_phone,
+                    products=(st.session_state.products),
+                    subtotal=subtotal,
+                    gst_rate=gst_rate,
+                    gst_amount=gst_amount,
+                    grand_total=grand_total,
+                    payment_method=payment_method,
+                    inventory_updated="Pending",
+                )
+
+                if not bill_saved:
+                    st.error(f"❌ {bill_message}")
+
+                else:
+                    # =========================================
+                    # UPDATE INVENTORY
+                    # =========================================
+
+                    inventory_done, inventory_message = reduce_inventory_once(
+                        st.session_state.products,
+                        st.session_state.transaction_id,
+                        inventory_df,
+                    )
+
+                    if inventory_done:
+                        # =====================================
+                        # MARK INVENTORY AS UPDATED
+                        # =====================================
+
+                        inventory_marked = mark_inventory_updated(
+                            st.session_state.transaction_id, saved_bills_df
+                        )
+
+                        if not inventory_marked:
+                            st.warning(
+                                "⚠️ Inventory was reduced, but the "
+                                "Bills sheet could not be marked as Updated."
+                            )
+
+                        else:
+                            st.session_state.bill_saved = True
+                            st.session_state.inventory_updated = True
+
+                            st.success(
+                                f"✅ Bill No {bill_no} saved "
+                                "and inventory updated successfully!"
+                            )
+
+                    else:
+                        st.warning(f"⚠️ {inventory_message}")
+
+                        st.warning("The bill was saved, but inventory was not changed.")
+
+            except Exception as e:
+                st.error("❌ Bill processing failed.")
+
+                st.error(f"Details: {e}")
 
 # ========================================================
 # BILL HISTORY
@@ -1101,26 +2028,149 @@ st.divider()
 
 st.header("📊 Bill History")
 
-if st.button("🔄 Refresh Bill History"):
+if st.button("🔄 Refresh Bill History", key="refresh_bill_history"):
     try:
-        bills_df = conn.read(worksheet="Bills", ttl=0)
+        get_bills.clear()  # Force fresh Google Sheet read
+
+        bills_df = get_bills()
 
         if bills_df.empty:
             st.info("No bills found.")
 
         else:
+            # ====================================================
+            # CLEAN DATA TYPES BEFORE DISPLAYING
+            # ====================================================
+
+            # Convert Inventory Updated to text
+            if "Inventory Updated" in bills_df.columns:
+                bills_df["Inventory Updated"] = (
+                    bills_df["Inventory Updated"].fillna("").astype(str).str.strip()
+                )
+
+            # Convert Transaction ID to text
+            if "Transaction ID" in bills_df.columns:
+                bills_df["Transaction ID"] = (
+                    bills_df["Transaction ID"].fillna("").astype(str)
+                )
+
+            # Convert Customer Number to text
+            if "Customer Number" in bills_df.columns:
+                bills_df["Customer Number"] = (
+                    bills_df["Customer Number"].fillna("").astype(str)
+                )
+
+            # Convert Bill No safely to integer
+            if "Bill No" in bills_df.columns:
+                bills_df["Bill No"] = (
+                    pd
+                    .to_numeric(bills_df["Bill No"], errors="coerce")
+                    .fillna(0)
+                    .astype(int)
+                )
+
+            # Convert Quantity safely to integer
+            if "Quantity" in bills_df.columns:
+                bills_df["Quantity"] = (
+                    pd
+                    .to_numeric(bills_df["Quantity"], errors="coerce")
+                    .fillna(0)
+                    .astype(int)
+                )
+
+            # Convert numeric money columns
+            money_columns = [
+                "Rate",
+                "Amount",
+                "Sub Total",
+                "GST %",
+                "GST Amount",
+                "Grand Total",
+            ]
+
+            for column in money_columns:
+                if column in bills_df.columns:
+                    bills_df[column] = pd.to_numeric(
+                        bills_df[column], errors="coerce"
+                    ).fillna(0.0)
+
+            # ====================================================
+            # DISPLAY BILL HISTORY
+            # ====================================================
+
             st.dataframe(bills_df, width="stretch", hide_index=True)
 
     except Exception as e:
         st.error(f"Could not load bill history: {e}")
 
+# ============================================================
+# CURRENT INVENTORY
+# ============================================================
 
-# ========================================================
+st.divider()
+st.header("📦 Current Inventory")
+
+# Refresh Inventory button
+if st.button("🔄 Refresh Inventory", key="refresh_inventory"):
+    get_inventory.clear()
+
+    try:
+        inventory_df = get_inventory()
+
+        if inventory_df.empty:
+            st.warning("No inventory items found.")
+        else:
+            st.success("✅ Inventory updated from Google Sheets.")
+
+    except Exception as e:
+        st.error(f"Could not refresh inventory: {e}")
+
+# Always load current inventory for display
+try:
+    inventory_df = get_inventory()
+
+    if inventory_df.empty:
+        st.info("No inventory items found.")
+    else:
+        # Make a clean copy for display
+        display_inventory = inventory_df.copy()
+
+        # Rename Stock for a more user-friendly display
+        display_inventory = display_inventory.rename(
+            columns={"Item": "Product", "Stock": "Current Stock"}
+        )
+
+        # Display inventory
+        st.dataframe(display_inventory, width="stretch", hide_index=True)
+
+except Exception as e:
+    st.error(f"Could not load inventory: {e}")
+
+# ============================================================
+# DOWNLOAD CURRENT INVENTORY
+# ============================================================
+
+inventory_excel = BytesIO()
+
+with pd.ExcelWriter(inventory_excel, engine="openpyxl") as writer:
+    inventory_df.to_excel(writer, index=False, sheet_name="Inventory")
+
+inventory_excel.seek(0)
+
+st.download_button(
+    label="📥 Download Current Inventory",
+    data=inventory_excel,
+    file_name="Sajad_Arts_Current_Inventory.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    width="stretch",
+)
+
+# ============================================================
 # DOWNLOAD EXCEL
-# ========================================================
+# ============================================================
 
 try:
-    bills_df = conn.read(worksheet="Bills", ttl=0)
+    bills_df = get_bills()
 
     if not bills_df.empty:
         excel_buffer = BytesIO()
@@ -1130,16 +2180,29 @@ try:
 
         excel_buffer.seek(0)
 
+        # ====================================================
+        # CREATE SHOP NAME BASED FILE NAME
+        # ====================================================
+
+        safe_shop_name = re.sub(r"[^A-Za-z0-9]+", "_", shop_name).strip("_")
+
+        databook_filename = f"{safe_shop_name}_Databook.xlsx"
+
+        # ====================================================
+        # DOWNLOAD BUTTON
+        # ====================================================
+
         st.download_button(
             label="📥 Download All Bills as Excel",
             data=excel_buffer,
-            file_name="Sajad Arts Databook.xlsx",
+            file_name=databook_filename,
             mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
             width="stretch",
         )
 
 except Exception as e:
     st.error(f"Could not create Excel file: {e}")
+
 
 # ============================================================
 # DOWNLOAD + WHATSAPP
@@ -1209,11 +2272,17 @@ if "pdf_bytes" in st.session_state:
     # WHATSAPP MESSAGE
     # ========================================================
 
+    # IMPORTANT:
+    # Always use the bill number that was actually generated,
+    # not the current bill number after Streamlit reruns.
+
+    whatsapp_bill_no = st.session_state.get("generated_bill_no", bill_no)
+
     whatsapp_message = f"""Hello {customer_name},
 
     Thank you for shopping with {shop_name}.
 
-    Bill No: {bill_no}
+    Bill No: {whatsapp_bill_no}
     Total Items: {total_items}
     Grand Total: ₹{grand_total:,.2f}
 
@@ -1268,7 +2337,6 @@ st.info(
     "message already prepared. Attach the downloaded PDF "
     "and press Send."
 )
-
 # ============================================================
 # NEW BILL
 # ============================================================
@@ -1276,14 +2344,27 @@ st.info(
 st.divider()
 
 if st.button("🔄 Start New Bill", width="stretch"):
+    # Clear products
     st.session_state.products = []
 
+    # Clear PDF
     if "pdf_bytes" in st.session_state:
         del st.session_state.pdf_bytes
 
-    # Reset product input widgets
+    # Clear generated bill
+    if "generated_bill_no" in st.session_state:
+        del st.session_state.generated_bill_no
+
+    # Reset product widgets
     st.session_state.product_form_reset += 1
 
-    st.session_state.bill_no = int(bill_no) + 1
+    # New transaction ID
+    st.session_state.transaction_id = str(uuid.uuid4())
 
+    # Reset bill status
+    st.session_state.bill_saved = False
+    st.session_state.inventory_updated = False
+
+    # Get bill number from Google Sheets
+    st.session_state.current_bill_no += 1
     st.rerun()
