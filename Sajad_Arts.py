@@ -11,7 +11,9 @@ from reportlab.platypus import (
     Table,
     TableStyle,
     HRFlowable,
+    Image,
 )
+from reportlab.lib.utils import ImageReader
 from urllib.parse import quote
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
@@ -20,6 +22,7 @@ import re
 from datetime import datetime
 import uuid
 import hashlib
+import os
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -444,6 +447,42 @@ def generate_pdf(
     # ========================================================
     # SHOP HEADER
     # ========================================================
+
+    # --------------------------------------------------------
+    # SHOP LOGO
+    # --------------------------------------------------------
+
+    logo_path = os.path.join(
+        os.path.dirname(__file__),
+        "assets",
+        "Shop_logo1.jpeg",
+    )
+
+    if os.path.exists(logo_path):
+        try:
+            logo_reader = ImageReader(logo_path)
+
+            logo_width_original, logo_height_original = logo_reader.getSize()
+
+            # Maximum logo width on 80mm receipt
+            logo_width = 25 * mm
+
+            # Keep original aspect ratio
+            logo_height = logo_width * logo_height_original / logo_width_original
+
+            logo = Image(
+                logo_path,
+                width=logo_width,
+                height=logo_height,
+            )
+
+            logo.hAlign = "CENTER"
+
+            story.append(logo)
+            story.append(Spacer(1, 2))
+
+        except Exception:
+            pass
 
     # ========================================================
     # CLICKABLE SHOP NAME → GOOGLE MAPS
@@ -1020,7 +1059,7 @@ def update_inventory(inventory_df):
     if "Total Stock" not in inventory_df.columns:
         inventory_df["Total Stock"] = inventory_df["Stock"]
 
-    # Keep all inventory columns
+    # Keep internal columns
     inventory_df = inventory_df[["Item", "Total Stock", "Stock"]].copy()
 
     # Clean Item
@@ -1047,16 +1086,120 @@ def update_inventory(inventory_df):
         subset=["Item"], keep="last"
     ).reset_index(drop=True)
 
-    # Save Item + Total Stock + Current Stock
-    conn.update(worksheet="Inventory", data=inventory_df)
+    # Convert internal Stock name to Google Sheet name
+    inventory_to_save = inventory_df.rename(columns={"Stock": "Current Stock"})
 
-    # Clear ONLY the inventory cache
+    # Save to Google Sheets
+    conn.update(
+        worksheet="Inventory",
+        data=inventory_to_save[["Item", "Total Stock", "Current Stock"]],
+    )
+
+    # Clear inventory cache
     get_inventory.clear()
 
 
 # ========================================================
 # CHECK INVENTORY BEFORE BILL
 # ========================================================
+
+# ========================================================
+# RESTOCK INVENTORY
+# ========================================================
+
+
+def restock_inventory(item_name, quantity_added, reason="Restock"):
+
+    if quantity_added <= 0:
+        return False, "Quantity added must be greater than 0."
+
+    try:
+        # Always get the latest inventory before restocking
+        get_inventory.clear()
+        inventory_df = get_inventory()
+
+        # Find product
+        matching_rows = inventory_df[
+            inventory_df["Item"].astype(str).str.strip().str.lower()
+            == item_name.strip().lower()
+        ]
+
+        if matching_rows.empty:
+            return False, f"Product '{item_name}' was not found in Inventory."
+
+        index = matching_rows.index[0]
+
+        # Current stock before restock
+        stock_before = int(inventory_df.loc[index, "Stock"])
+
+        # Calculate new current stock
+        stock_after = stock_before + int(quantity_added)
+
+        # Update ONLY Current Stock internally
+        inventory_df.loc[index, "Stock"] = stock_after
+
+        # Save updated inventory
+        update_inventory(inventory_df)
+
+        # ====================================================
+        # CREATE STOCK HISTORY RECORD
+        # ====================================================
+
+        history_row = pd.DataFrame([
+            {
+                "Date": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                "Transaction ID": str(uuid.uuid4()),
+                "Item": item_name.strip(),
+                "Stock Added": int(quantity_added),
+                "Stock Before": stock_before,
+                "Stock After": stock_after,
+                "Reason": reason.strip(),
+            }
+        ])
+
+        # Read existing Stock History
+        try:
+            history_df = conn.read(worksheet="Stock History", ttl=0)
+        except Exception:
+            history_df = pd.DataFrame()
+
+        # Append new history record
+        if history_df.empty:
+            final_history = history_row
+        else:
+            final_history = pd.concat([history_df, history_row], ignore_index=True)
+
+        # Keep history columns in correct order
+        history_columns = [
+            "Date",
+            "Transaction ID",
+            "Item",
+            "Stock Added",
+            "Stock Before",
+            "Stock After",
+            "Reason",
+        ]
+
+        for column in history_columns:
+            if column not in final_history.columns:
+                final_history[column] = ""
+
+        final_history = final_history[history_columns]
+
+        # Save Stock History
+        conn.update(worksheet="Stock History", data=final_history)
+
+        # Refresh inventory cache
+        get_inventory.clear()
+
+        return (
+            True,
+            f"✅ Added {quantity_added} units of {item_name}. "
+            f"Current Stock: {stock_before} → {stock_after}",
+        )
+
+    except Exception as e:
+        return False, f"Could not restock inventory: {e}"
 
 
 def check_inventory(products, inventory_df):
@@ -1261,6 +1404,55 @@ if st.sidebar.button(
         st.sidebar.success("✅ Inventory refreshed from Google Sheets.")
     except Exception as e:
         st.sidebar.error(f"Could not refresh inventory: {e}")
+
+# --------------------------------------------------------
+# RESTOCK INVENTORY
+# --------------------------------------------------------
+
+st.sidebar.divider()
+
+st.sidebar.subheader("📥 Restock Inventory")
+
+restock_product = st.sidebar.selectbox(
+    "Product",
+    inventory_df["Item"].dropna().astype(str).str.strip().tolist(),
+    key="restock_product",
+)
+
+restock_quantity = st.sidebar.number_input(
+    "Quantity Added",
+    min_value=1,
+    value=1,
+    step=1,
+    format="%d",
+    key="restock_quantity",
+)
+
+restock_reason = st.sidebar.text_input(
+    "Reason",
+    value="Restock",
+    key="restock_reason",
+)
+
+if st.sidebar.button(
+    "➕ Add Stock",
+    key="add_stock_button",
+    use_container_width=True,
+):
+    success, message = restock_inventory(
+        item_name=restock_product,
+        quantity_added=restock_quantity,
+        reason=restock_reason,
+    )
+
+    if success:
+        st.sidebar.success(message)
+
+        # Load latest inventory immediately
+        inventory_df = get_inventory()
+
+    else:
+        st.sidebar.error(message)
 
 # --------------------------------------------------------
 # DOWNLOAD INVENTORY
