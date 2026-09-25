@@ -20,6 +20,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from io import BytesIO
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import uuid
 import hashlib
 import os
@@ -504,7 +505,7 @@ def generate_pdf(
     # BILL INFORMATION
     # ========================================================
 
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
     bill_info = [
         [
@@ -822,7 +823,9 @@ def save_bill_to_google_sheet(
     inventory_updated="Pending",
 ):
 
-    bill_date = datetime.now().strftime("%d/%m/%y")
+    bill_date = datetime.now(
+    ZoneInfo("Asia/Kolkata")
+).strftime("%d/%m/%y")
 
     # ----------------------------------------------------
     # READ EXISTING BILLS
@@ -1147,7 +1150,9 @@ def restock_inventory(item_name, quantity_added, reason="Restock"):
 
         history_row = pd.DataFrame([
             {
-                "Date": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                "Date": datetime.now(
+    ZoneInfo("Asia/Kolkata")
+).strftime("%d/%m/%Y %H:%M:%S"),
                 "Transaction ID": str(uuid.uuid4()),
                 "Item": item_name.strip(),
                 "Stock Added": int(quantity_added),
